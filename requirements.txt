@@ -1,0 +1,4 @@
+pytest
+pyqt6
+matplotlib
+pyqtgraph
