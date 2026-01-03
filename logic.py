@@ -276,6 +276,16 @@ def recover_session(session_id):
     conn.commit()
     conn.close()
 
+def update_session(session_id, entity_id, start_time, end_time):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sessions SET entity_id = ?, start_time = ?, end_time = ? WHERE id = ?",
+        (entity_id, start_time.isoformat(), end_time.isoformat(), session_id)
+    )
+    conn.commit()
+    conn.close()
+
 
 def saveSessionsToFile(sessions, filename='complete_sessions.txt'):
     # In SQLite, we typically don't 'save all' unless migrating.

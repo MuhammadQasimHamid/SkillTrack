@@ -19,10 +19,12 @@ from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QPushButton, QMessageBox,
-    QComboBox, QTabWidget, QFormLayout, QDialog, QDialogButtonBox, QDateEdit, QSizePolicy, QStyle, QFileDialog,
+    QComboBox, QTabWidget, QFormLayout, QDialog, QDialogButtonBox, QDateEdit, QDateTimeEdit, QSizePolicy, QStyle, QFileDialog,
     QSystemTrayIcon, QMenu, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QDate, QSettings, QSize, QPoint
+from PyQt6.QtCore import Qt, QTimer, QDate, QDateTime, QSettings, QSize, QPoint
+import urllib.request
+import json
 
 # Matplotlib (optional) for plotting reports
 try:
@@ -47,7 +49,7 @@ from skilltrack.controller import (
     get_completed_sessions, generate_report,
     register_user, login_user, logout_user, is_authenticated, current_user, list_users,
     get_goals, add_goal, update_goal, delete_goal,
-    delete_session, recover_session
+    delete_session, recover_session, add_manual_session, update_session
 )
 from PyQt6.QtGui import QAction, QIcon
 
@@ -263,6 +265,76 @@ class TrashBinDialog(QDialog):
             self.parent().load_sessions()
 
 
+class ManualSessionDialog(QDialog):
+    def __init__(self, entities, parent=None, session=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Manual Session" if not session else "Edit Session")
+        self.layout = QFormLayout(self)
+        
+        self.entity_combo = QComboBox()
+        for e in entities:
+            self.entity_combo.addItem(e.name, userData=e.id)
+            
+        if session:
+            idx = self.entity_combo.findData(session.entityId)
+            if idx >= 0:
+                self.entity_combo.setCurrentIndex(idx)
+            self.start_dt = QDateTimeEdit(QDateTime(session.startTime))
+            self.end_dt = QDateTimeEdit(QDateTime(session.endTime))
+        else:
+            self.start_dt = QDateTimeEdit(QDateTime.currentDateTime().addSecs(-3600))
+            self.end_dt = QDateTimeEdit(QDateTime.currentDateTime())
+
+        self.start_dt.setCalendarPopup(True)
+        self.end_dt.setCalendarPopup(True)
+        
+        self.layout.addRow("Entity:", self.entity_combo)
+        self.layout.addRow("Start Time:", self.start_dt)
+        self.layout.addRow("End Time:", self.end_dt)
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addRow(self.buttons)
+
+    def get_data(self):
+        return (
+            self.entity_combo.currentData(),
+            self.start_dt.dateTime().toPyDateTime(),
+            self.end_dt.dateTime().toPyDateTime()
+        )
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.layout = QFormLayout(self)
+        
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Light", "Dark", "System"])
+        current_theme = QSettings("SkillTrack", "SkillTrackGUI").value("theme", "System")
+        self.theme_combo.setCurrentText(current_theme)
+        
+        self.sync_btn = QPushButton("Sync Time with Internet")
+        self.sync_btn.clicked.connect(self.on_sync_time)
+        
+        self.layout.addRow("Theme:", self.theme_combo)
+        self.layout.addRow("Clock:", self.sync_btn)
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addRow(self.buttons)
+
+    def get_theme(self):
+        return self.theme_combo.currentText()
+
+    def on_sync_time(self):
+        if self.parent():
+            self.parent().sync_time()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -313,6 +385,10 @@ class MainWindow(QMainWindow):
         # System Tray initialization
         self.setup_system_tray()
 
+        # Apply saved theme
+        current_theme = self.settings.value("theme", "System")
+        self.apply_theme(current_theme)
+
         self.refresh_all()
 
     def _build_account_menu(self):
@@ -361,8 +437,14 @@ class MainWindow(QMainWindow):
         self.logout_timer_btn = QPushButton('Logout')
         self.logout_timer_btn.setToolTip('Logout current user')
         self.logout_timer_btn.clicked.connect(self.on_logout)
+        
+        self.manual_session_btn = QPushButton('Manual Session')
+        self.manual_session_btn.setToolTip('Add session start and end datetime manually')
+        self.manual_session_btn.clicked.connect(self.add_manual_session_ui)
+        
         top_controls.addWidget(self.switch_user_btn)
         top_controls.addStretch()
+        top_controls.addWidget(self.manual_session_btn)
         top_controls.addWidget(self.logout_timer_btn)
         layout.addLayout(top_controls)
 
@@ -504,8 +586,14 @@ class MainWindow(QMainWindow):
         self.sessions_entity_combo.currentIndexChanged.connect(self.load_sessions)
         self.sessions_refresh_btn = QPushButton('Refresh')
         self.sessions_refresh_btn.clicked.connect(self.load_sessions)
+        
+        self.settings_btn = QPushButton('Settings')
+        self.settings_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.settings_btn.clicked.connect(self.open_settings)
+        
         top.addWidget(self.sessions_entity_combo)
         top.addWidget(self.sessions_refresh_btn)
+        top.addWidget(self.settings_btn)
         layout.addLayout(top)
 
         # sessions list
@@ -523,17 +611,23 @@ class MainWindow(QMainWindow):
         
         bottom_row.addStretch()
 
+        self.edit_session_btn = QPushButton("Edit")
+        self.edit_session_btn.setToolTip("Edit selected session")
+        self.edit_session_btn.setFixedWidth(80)
+        self.edit_session_btn.clicked.connect(self.on_edit_session)
+
         self.delete_session_btn = QPushButton("Delete")
         self.delete_session_btn.setToolTip("Delete selected session")
         self.delete_session_btn.setFixedWidth(80)
         self.delete_session_btn.clicked.connect(self.on_delete_session)
-        
+
         self.trash_btn = QPushButton("Trash")
         self.trash_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
         self.trash_btn.setToolTip("View deleted sessions")
         self.trash_btn.setFixedWidth(80)
         self.trash_btn.clicked.connect(self.on_open_trash)
         
+        bottom_row.addWidget(self.edit_session_btn)
         bottom_row.addWidget(self.delete_session_btn)
         bottom_row.addWidget(self.trash_btn)
         layout.addLayout(bottom_row)
@@ -720,8 +814,9 @@ class MainWindow(QMainWindow):
                 h_s = elapsed_seconds // 3600
                 m_s = (elapsed_seconds % 3600) // 60
                 s_s = elapsed_seconds % 60
-                elapsed_label.setText(f"{h_s:02d}:{m_s:02d}:{s_s:02d}")
-                elapsed_label.setStyleSheet('color:#2ecc71;font-weight:bold;font-size:12px;')
+                start_str = active.startTime.strftime('%#m/%#d/%y %#I:%M:%S %p').lower()
+                elapsed_label.setText(f"<span style='font-size: 9px; font-weight: normal;'>{start_str}</span> | <span style='font-size: 13px; font-weight: bold;'>{h_s:02d}:{m_s:02d}:{s_s:02d}</span>")
+                elapsed_label.setStyleSheet('') # Use rich text for styling
             else:
                 btn.setText('Start')
                 btn.setObjectName('startBtn')
@@ -815,6 +910,22 @@ class MainWindow(QMainWindow):
         confirm = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete session {s.id}?")
         if confirm == QMessageBox.StandardButton.Yes:
             delete_session(s.id)
+            self.load_sessions()
+
+    def on_edit_session(self):
+        item = self.sessions_list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "Select Session", "Please select a session to edit.")
+            return
+        s = item.data(Qt.ItemDataRole.UserRole)
+        dlg = ManualSessionDialog(self.entities, self, session=s)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            eid, start, end = dlg.get_data()
+            if end <= start:
+                QMessageBox.warning(self, "Invalid Time", "End time must be after start time.")
+                return
+            update_session(s.id, eid, start, end)
+            QMessageBox.information(self, "Success", "Session updated.")
             self.load_sessions()
 
     def show_session_details(self, item):
@@ -980,6 +1091,67 @@ class MainWindow(QMainWindow):
         if confirm == QMessageBox.StandardButton.Yes:
             delete_goal(g.id)
             self.load_goals()
+
+    def add_manual_session_ui(self):
+        dlg = ManualSessionDialog(self.entities, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            eid, start, end = dlg.get_data()
+            if end <= start:
+                QMessageBox.warning(self, "Invalid Time", "End time must be after start time.")
+                return
+            add_manual_session(eid, start, end)
+            QMessageBox.information(self, "Success", "Manual session added.")
+            self.refresh_all()
+
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            theme = dlg.get_theme()
+            self.settings.setValue("theme", theme)
+            self.apply_theme(theme)
+
+    def apply_theme(self, theme):
+        if theme == "Dark":
+            self.setStyleSheet("""
+                QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
+                QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Arial; font-size: 11px; }
+                QPushButton { background-color: #333333; color: #d4d4d4; border: 1px solid #444; padding: 4px; border-radius: 4px; }
+                QPushButton:hover { background-color: #444444; }
+                QPushButton#startBtn { background-color: #1e7e34; color: white; border-radius: 6px; }
+                QPushButton#stopBtn { background-color: #bd2130; color: white; border-radius: 6px; }
+                QListWidget, QTextEdit, QComboBox, QDateEdit, QDateTimeEdit { background-color: #252526; color: #d4d4d4; border: 1px solid #333; }
+                QLabel { color: #d4d4d4; }
+                QTabWidget::pane { border: 1px solid #333; }
+                QTabBar::tab { background: #2d2d2d; color: #d4d4d4; padding: 6px; }
+                QTabBar::tab:selected { background: #1e1e1e; border-bottom: 2px solid #007acc; }
+            """)
+        elif theme == "Light":
+            self.setStyleSheet("""
+                QMainWindow { background-color: #f0f4f8; }
+                QWidget { font-family: 'Segoe UI', Arial; font-size: 11px; }
+                QPushButton#startBtn { background-color: #2ecc71; color: white; border-radius: 6px; padding: 4px; }
+                QPushButton#stopBtn { background-color: #e74c3c; color: white; border-radius: 6px; padding: 4px; }
+                QListWidget { background: #ffffff; border: 1px solid #ddd; padding: 4px; }
+                QTextEdit { background: #ffffff; border: 1px solid #ddd; padding: 6px; }
+                QLabel { color: #333; }
+            """)
+        else: # System
+            self.setStyleSheet("")
+
+    def sync_time(self):
+        try:
+            # Use WorldTimeAPI (may require internet)
+            req = urllib.request.Request("http://worldtimeapi.org/api/ip", headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+                # Example: "2023-10-27T10:00:00.123456+01:00"
+                dt_str = data['datetime'].split('.')[0]
+                internet_time = datetime.fromisoformat(dt_str)
+                QMessageBox.information(self, "Time Sync", 
+                    f"Internet Time: {internet_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    "Please adjust your system settings if this time is different.")
+        except Exception as e:
+            QMessageBox.warning(self, "Sync Error", f"Failed to fetch time: {e}")
 
 class FullReportWindow(QDialog):
     def __init__(self, parent=None, entities=None, start_date=None, end_date=None, aggregation='Day', entity_filter=None):

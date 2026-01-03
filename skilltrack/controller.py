@@ -24,7 +24,8 @@ from logic import (
     endSession,
     get_db_connection,
     delete_session as logic_delete_session,
-    recover_session as logic_recover_session
+    recover_session as logic_recover_session,
+    update_session as logic_update_session
 )
 
 # Simple in-memory auth state for the running application
@@ -90,12 +91,23 @@ def get_completed_sessions(include_deleted: bool = False):
     return loadSessionsFromFile(username=current_user(), include_deleted=include_deleted)
 
 
+def add_manual_session(entity_id: int, start_dt, end_dt):
+    from logic import Session, appendSessionToFile
+    session = Session(id=0, startTime=start_dt, endTime=end_dt, entityId=entity_id)
+    appendSessionToFile(session)
+    return session
+
+
 def delete_session(session_id: int):
     logic_delete_session(session_id)
 
 
-def recover_session(session_id: int):
+def recover_session(session_id):
     logic_recover_session(session_id)
+
+
+def update_session(session_id: int, entity_id: int, start_dt, end_dt):
+    logic_update_session(session_id, entity_id, start_dt, end_dt)
 
 
 def generate_report(entity: Entity, start, end):
