@@ -1,5 +1,6 @@
-# SkillTrack controller: thin UI-facing API that wraps logic.py
 from typing import List, Optional
+import os
+import sqlite3
 from logic import (
     Entity,
     Session,
@@ -19,6 +20,11 @@ from logic import (
     loadGoalsFromFile,
     appendGoalToFile,
     saveGoalsToFile,
+    startSession,
+    endSession,
+    get_db_connection,
+    delete_session as logic_delete_session,
+    recover_session as logic_recover_session
 )
 
 # Simple in-memory auth state for the running application
@@ -26,13 +32,13 @@ _current_user: Optional[str] = None
 
 import os
 
-# Helper to create per-user filenames under data/<username>/
+# Helper for any remaining user-specific files (not database)
 def _user_file(base: str, username: Optional[str]) -> str:
     if not username:
         return f"{base}.txt"
     safe = username.replace(' ', '_')
     userdir = os.path.join('data', safe)
-    # ensure directory exists when called from controller
+    # ensure directory exists
     try:
         os.makedirs(userdir, exist_ok=True)
     except Exception:
@@ -43,83 +49,57 @@ def _user_file(base: str, username: Optional[str]) -> str:
 # Controller functions used by UI
 
 def get_entities() -> List[Entity]:
-    fname = _user_file('entities', current_user())
-    return loadEntitiesFromFile(filename=fname)
+    return loadEntitiesFromFile(username=current_user())
 
 
 def create_entity(name: str, type_: str, description: str) -> Entity:
-    fname = _user_file('entities', current_user())
-    entities = loadEntitiesFromFile(filename=fname)
-    next_id = max((e.id for e in entities), default=0) + 1
-    ent = Entity(id=next_id, name=name, type=type_, description=description)
-    appendEntityToFile(ent, filename=fname)
+    ent = Entity(id=0, name=name, type=type_, description=description)
+    appendEntityToFile(ent, username=current_user())
     return ent
 
 
 def delete_entity(entity_id: int) -> bool:
-    fname = _user_file('entities', current_user())
-    entities = loadEntitiesFromFile(filename=fname)
-    new_list = [e for e in entities if e.id != entity_id]
-    if len(new_list) == len(entities):
-        return False
-    saveEntitesToFile(new_list, filename=fname)
-    return True
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM entities WHERE id = ? AND username = ?", (entity_id, current_user()))
+    rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return rows > 0
 
 
 def update_entity(entity_id: int, name: str, type_: str, description: str, filename: str = None) -> bool:
-    fname = filename or _user_file('entities', current_user())
-    entities = loadEntitiesFromFile(fname)
-    updated = False
-    for e in entities:
-        if e.id == entity_id:
-            e.name = name
-            e.type = type_
-            e.description = description
-            updated = True
-            break
-    if updated:
-        saveEntitesToFile(entities, filename=fname)
-    return updated
+    ent = Entity(id=entity_id, name=name, type=type_, description=description)
+    saveEntitesToFile([ent], username=current_user())
+    return True
 
 
 def get_started_sessions():
-    fname = _user_file('started_sessions', current_user())
-    return loadStartedSessionsFromFile(filename=fname)
+    return loadStartedSessionsFromFile(username=current_user())
 
 
 def start_entity_session(entity: Entity):
-    # create a started session in the user's started sessions file
-    fname = _user_file('started_sessions', current_user())
-    started = loadStartedSessionsFromFile(filename=fname)
-    next_id = max((s.id for s in started), default=0) + 1
-    from datetime import datetime
-    session = Session(id=next_id, startTime=datetime.now(), endTime=None, entityId=entity.id)
-    appendStartedSessionToFile(session, filename=fname)
-    return session
+    return startSession(entity)
 
 
 def stop_session(session):
-    started_fname = _user_file('started_sessions', current_user())
-    completed_fname = _user_file('complete_sessions', current_user())
-    sessions = loadStartedSessionsFromFile(filename=started_fname)
-    for s in sessions:
-        if s.id == session.id:
-            from datetime import datetime
-            s.endTime = datetime.now()
-            appendSessionToFile(s, filename=completed_fname)
-            sessions.remove(s)
-            saveStartedSessionsToFile(sessions, filename=started_fname)
-            return s
+    return endSession(session)
 
 
-def get_completed_sessions():
-    fname = _user_file('complete_sessions', current_user())
-    return loadSessionsFromFile(filename=fname)
+def get_completed_sessions(include_deleted: bool = False):
+    return loadSessionsFromFile(username=current_user(), include_deleted=include_deleted)
+
+
+def delete_session(session_id: int):
+    logic_delete_session(session_id)
+
+
+def recover_session(session_id: int):
+    logic_recover_session(session_id)
 
 
 def generate_report(entity: Entity, start, end):
-    fname = _user_file('complete_sessions', current_user())
-    return GenerateReport(entity, start, end, filename=fname)
+    return GenerateReport(entity, start, end, username=current_user())
 
 
 # --- Authentication API ---
@@ -158,43 +138,26 @@ def list_users() -> List[str]:
 # --- Goals API ---
 
 def get_goals(entity_id: Optional[int] = None) -> List[Goal]:
-    fname = _user_file('goals', current_user())
-    all_goals = loadGoalsFromFile(filename=fname)
-    if entity_id is not None:
-        return [g for g in all_goals if g.entityId == entity_id]
-    return all_goals
+    return loadGoalsFromFile(username=current_user())
 
 
 def add_goal(entity_id: int, name: str, target_hours: float) -> Goal:
-    fname = _user_file('goals', current_user())
-    all_goals = loadGoalsFromFile(filename=fname)
-    next_id = max((g.id for g in all_goals), default=0) + 1
-    goal = Goal(id=next_id, entityId=entity_id, name=name, targetHours=target_hours, status='Incomplete')
-    appendGoalToFile(goal, filename=fname)
+    goal = Goal(id=0, entityId=entity_id, name=name, targetHours=target_hours, status='Incomplete')
+    appendGoalToFile(goal)
     return goal
 
 
 def update_goal(goal_id: int, name: str, target_hours: float, status: str) -> bool:
-    fname = _user_file('goals', current_user())
-    all_goals = loadGoalsFromFile(filename=fname)
-    updated = False
-    for g in all_goals:
-        if g.id == goal_id:
-            g.name = name
-            g.targetHours = target_hours
-            g.status = status
-            updated = True
-            break
-    if updated:
-        saveGoalsToFile(all_goals, filename=fname)
-    return updated
+    goal = Goal(id=goal_id, entityId=0, name=name, targetHours=target_hours, status=status)
+    saveGoalsToFile([goal])
+    return True
 
 
 def delete_goal(goal_id: int) -> bool:
-    fname = _user_file('goals', current_user())
-    all_goals = loadGoalsFromFile(filename=fname)
-    new_list = [g for g in all_goals if g.id != goal_id]
-    if len(new_list) == len(all_goals):
-        return False
-    saveGoalsToFile(new_list, filename=fname)
-    return True
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+    rows = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return rows > 0

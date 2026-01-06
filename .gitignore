@@ -1,6 +1,10 @@
 completed_sessions.txt
 started_sessions.txt
 entities.txt
+users.txt
+login.txt
+skilltrack.db
+data/
 __pycache__/
 .vscode/
 env/

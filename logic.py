@@ -108,6 +108,7 @@ def init_db():
             entity_id INTEGER NOT NULL,
             start_time TEXT NOT NULL,
             end_time TEXT,
+            is_deleted INTEGER DEFAULT 0,
             FOREIGN KEY (entity_id) REFERENCES entities (id)
         )
     ''')
@@ -211,228 +212,212 @@ def calculateTotalTime(sessions):
     
     return int(hours), int(minutes), int(seconds)
 
-def GenerateReport(entity, startDate, endDate, filename='complete_sessions.txt'):
-    allSessions = loadSessionsFromFile(filename=filename)
+def GenerateReport(entity, startDate, endDate, filename='complete_sessions.txt', username=None):
+    allSessions = loadSessionsFromFile(username=username)
     filteredSessions = [s for s in allSessions if s.entityId == entity.id and s.startTime >= startDate and s.endTime <= endDate]
     hours, minutes, seconds = calculateTotalTime(filteredSessions)
-    return Report(id=len(allSessions) + 1, entityId=entity.id, startDate=startDate, endDate=endDate, totalTimeSpent=(hours, minutes, seconds))
+    return Report(id=0, entityId=entity.id, startDate=startDate, endDate=endDate, totalTimeSpent=(hours, minutes, seconds))
 
-# Function to append Completed session to a file
+
 def appendSessionToFile(session, filename='complete_sessions.txt'):
-    """Append a completed session using CSV and ISO timestamps."""
-    _ensure_file_exists(filename)
-    with open(filename, 'a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        start = session.startTime.isoformat() if session.startTime else ''
-        end = session.endTime.isoformat() if session.endTime else ''
-        writer.writerow([session.id, start, end, session.entityId])
+    """Append a completed session using SQLite."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    start = session.startTime.isoformat() if session.startTime else ''
+    end = session.endTime.isoformat() if session.endTime else ''
+    cursor.execute(
+        "INSERT INTO sessions (entity_id, start_time, end_time) VALUES (?, ?, ?)",
+        (session.entityId, start, end)
+    )
+    conn.commit()
+    conn.close()
 
 
-# load all sessions from file
-def loadSessionsFromFile(filename='complete_sessions.txt'):
+def loadSessionsFromFile(filename='complete_sessions.txt', username=None, include_deleted=False):
     sessions = []
-    if not os.path.exists(filename):
-        return sessions
-    with open(filename, 'r', newline='', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            if not row or len(row) < 4:
-                continue
-            try:
-                id = int(row[0])
-                start = _parse_iso_datetime(row[1])
-                end = _parse_iso_datetime(row[2])
-                entityId = int(row[3])
-                if start and end:
-                    sessions.append(Session(id, start, end, entityId))
-            except Exception:
-                # skip malformed rows
-                continue
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    deleted_filter = "" if include_deleted else "AND s.is_deleted = 0"
+    
+    if username:
+        # Join with entities to filter by user
+        cursor.execute(f'''
+            SELECT s.* FROM sessions s
+            JOIN entities e ON s.entity_id = e.id
+            WHERE e.username = ? AND s.end_time IS NOT NULL {deleted_filter}
+        ''', (username,))
+    else:
+        where_clause = "WHERE end_time IS NOT NULL"
+        if not include_deleted:
+            where_clause += " AND is_deleted = 0"
+        cursor.execute(f"SELECT * FROM sessions {where_clause}")
+        
+    for row in cursor.fetchall():
+        start = _parse_iso_datetime(row['start_time'])
+        end = _parse_iso_datetime(row['end_time'])
+        if start and end:
+            sessions.append(Session(row['id'], start, end, row['entity_id']))
+    conn.close()
     return sessions
+
+def delete_session(session_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE sessions SET is_deleted = 1 WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+def recover_session(session_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE sessions SET is_deleted = 0 WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
 def saveSessionsToFile(sessions, filename='complete_sessions.txt'):
-    _ensure_file_exists(filename)
-    dirpath = os.path.dirname(os.path.abspath(filename)) or '.'
-    tmpfd, tmpname = tempfile.mkstemp(dir=dirpath)
-    try:
-        with os.fdopen(tmpfd, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for session in sessions:
-                start = session.startTime.isoformat() if session.startTime else ''
-                end = session.endTime.isoformat() if session.endTime else ''
-                writer.writerow([session.id, start, end, session.entityId])
-        os.replace(tmpname, filename)
-    except Exception:
-        # Fallback: attempt direct write to target (non-atomic)
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for session in sessions:
-                start = session.startTime.isoformat() if session.startTime else ''
-                end = session.endTime.isoformat() if session.endTime else ''
-                writer.writerow([session.id, start, end, session.entityId])
-        try:
-            if os.path.exists(tmpname):
-                os.remove(tmpname)
-        except Exception:
-            pass
+    # In SQLite, we typically don't 'save all' unless migrating.
+    pass
 
-# Function to append Started session to a file
+
 def appendStartedSessionToFile(session, filename='started_sessions.txt'):
-    """Append a started session (end time is blank until ended)."""
-    _ensure_file_exists(filename)
-    with open(filename, 'a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        start = session.startTime.isoformat() if session.startTime else ''
-        writer.writerow([session.id, start, '', session.entityId])
-def loadStartedSessionsFromFile(filename='started_sessions.txt'):
-    sessions = []
-    if not os.path.exists(filename):
-        return sessions
-    with open(filename, 'r', newline='', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            if not row or len(row) < 4:
-                continue
-            try:
-                id = int(row[0])
-                start = _parse_iso_datetime(row[1])
-                entityId = int(row[3])
-                if start:
-                    sessions.append(Session(id, start, None, entityId))
-            except Exception:
-                continue
-    return sessions
-def saveStartedSessionsToFile(sessions, filename='started_sessions.txt'):
-    _ensure_file_exists(filename)
-    dirpath = os.path.dirname(os.path.abspath(filename)) or '.'
-    tmpfd, tmpname = tempfile.mkstemp(dir=dirpath)
-    try:
-        with os.fdopen(tmpfd, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for session in sessions:
-                start = session.startTime.isoformat() if session.startTime else ''
-                writer.writerow([session.id, start, '', session.entityId])
-        os.replace(tmpname, filename)
-    except Exception:
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for session in sessions:
-                start = session.startTime.isoformat() if session.startTime else ''
-                writer.writerow([session.id, start, '', session.entityId])
-        try:
-            if os.path.exists(tmpname):
-                os.remove(tmpname)
-        except Exception:
-            pass
+    """Append a started session in SQLite and update its id."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    start = session.startTime.isoformat() if session.startTime else ''
+    cursor.execute(
+        "INSERT INTO sessions (entity_id, start_time, end_time) VALUES (?, ?, ?)",
+        (session.entityId, start, None)
+    )
+    session.id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return session.id
 
-# Entity management functions
-def appendEntityToFile(entity, filename='entities.txt'):
-    _ensure_file_exists(filename)
-    with open(filename, 'a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow([entity.id, entity.name, entity.type, entity.description])
-def loadEntitiesFromFile(filename='entities.txt'):
+def loadStartedSessionsFromFile(filename='started_sessions.txt', username=None):
+    sessions = []
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if username:
+        cursor.execute('''
+            SELECT s.* FROM sessions s
+            JOIN entities e ON s.entity_id = e.id
+            WHERE e.username = ? AND s.end_time IS NULL
+        ''', (username,))
+    else:
+        cursor.execute("SELECT * FROM sessions WHERE end_time IS NULL")
+        
+    for row in cursor.fetchall():
+        start = _parse_iso_datetime(row['start_time'])
+        if start:
+            sessions.append(Session(row['id'], start, None, row['entity_id']))
+    conn.close()
+    return sessions
+
+def saveStartedSessionsToFile(sessions, filename='started_sessions.txt'):
+    # Manual synchronization not needed for SQLite.
+    pass
+
+def appendEntityToFile(entity, filename='entities.txt', username=None):
+    if not username:
+        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO entities (name, type, description, username) VALUES (?, ?, ?, ?)",
+        (entity.name, entity.type, entity.description, username)
+    )
+    new_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+def loadEntitiesFromFile(filename='entities.txt', username=None):
     entities = []
-    if not os.path.exists(filename):
-        return entities
-    with open(filename, 'r', newline='', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            if not row or len(row) < 4:
-                continue
-            try:
-                id = int(row[0])
-                name, type_, description = row[1], row[2], row[3]
-                entities.append(Entity(id, name, type_, description))
-            except Exception:
-                continue
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if username:
+        cursor.execute("SELECT * FROM entities WHERE username = ?", (username,))
+    else:
+        cursor.execute("SELECT * FROM entities")
+        
+    for row in cursor.fetchall():
+        entities.append(Entity(row['id'], row['name'], row['type'], row['description']))
+    conn.close()
     return entities
-def saveEntitesToFile(entities,filename='entities.txt'):
-    _ensure_file_exists(filename)
-    dirpath = os.path.dirname(os.path.abspath(filename)) or '.'
-    tmpfd, tmpname = tempfile.mkstemp(dir=dirpath)
-    try:
-        with os.fdopen(tmpfd, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for entity in entities:
-                writer.writerow([entity.id, entity.name, entity.type, entity.description])
-        os.replace(tmpname, filename)
-    except Exception:
-        with open(filename,'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for entity in entities:
-                writer.writerow([entity.id, entity.name, entity.type, entity.description])
-        try:
-            if os.path.exists(tmpname):
-                os.remove(tmpname)
-        except Exception:
-            pass
+
+def saveEntitesToFile(entities, filename='entities.txt', username=None):
+    """Update existing entities in SQLite."""
+    if not username:
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for e in entities:
+        cursor.execute(
+            "UPDATE entities SET name = ?, type = ?, description = ? WHERE id = ? AND username = ?",
+            (e.name, e.type, e.description, e.id, username)
+        )
+    conn.commit()
+    conn.close()
 
 
 def startSession(entity):
-    from datetime import datetime
-    started = loadStartedSessionsFromFile()
-    next_id = max((s.id for s in started), default=0) + 1
-    session = Session(id=next_id, startTime=datetime.now(), endTime=None, entityId=entity.id)
-    appendStartedSessionToFile(session)
+    session = Session(id=0, startTime=datetime.now(), endTime=None, entityId=entity.id)
+    new_id = appendStartedSessionToFile(session)
+    session.id = new_id
     return session
 
 def endSession(session):
-    sessions = loadStartedSessionsFromFile()
-    for s in sessions:
-        if s.id == session.id:
-            s.endTime = datetime.now()
-            appendSessionToFile(s) # Move to completed sessions
-            sessions.remove(s)
-            saveStartedSessionsToFile(sessions) # Update started sessions file
-            return s
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = datetime.now()
+    cursor.execute("UPDATE sessions SET end_time = ? WHERE id = ?", (now.isoformat(), session.id))
+    conn.commit()
+    conn.close()
+    session.endTime = now
+    return session
 
-# Goal management functions
 def appendGoalToFile(goal, filename='goals.txt'):
-    _ensure_file_exists(filename)
-    with open(filename, 'a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow([goal.id, goal.entityId, goal.name, goal.targetHours, goal.status])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO goals (entity_id, name, target_hours, status) VALUES (?, ?, ?, ?)",
+        (goal.entityId, goal.name, goal.targetHours, goal.status)
+    )
+    new_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
 
-def loadGoalsFromFile(filename='goals.txt'):
+def loadGoalsFromFile(filename='goals.txt', username=None):
     goals = []
-    if not os.path.exists(filename):
-        return goals
-    with open(filename, 'r', newline='', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            if not row or len(row) < 5:
-                continue
-            try:
-                id = int(row[0])
-                entityId = int(row[1])
-                name = row[2]
-                targetHours = float(row[3])
-                status = row[4]
-                goals.append(Goal(id, entityId, name, targetHours, status))
-            except Exception:
-                continue
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if username:
+        cursor.execute('''
+            SELECT g.* FROM goals g
+            JOIN entities e ON g.entity_id = e.id
+            WHERE e.username = ?
+        ''', (username,))
+    else:
+        cursor.execute("SELECT * FROM goals")
+        
+    for row in cursor.fetchall():
+        goals.append(Goal(row['id'], row['entity_id'], row['name'], row['target_hours'], row['status']))
+    conn.close()
     return goals
 
 def saveGoalsToFile(goals, filename='goals.txt'):
-    _ensure_file_exists(filename)
-    dirpath = os.path.dirname(os.path.abspath(filename)) or '.'
-    tmpfd, tmpname = tempfile.mkstemp(dir=dirpath)
-    try:
-        with os.fdopen(tmpfd, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for g in goals:
-                writer.writerow([g.id, g.entityId, g.name, g.targetHours, g.status])
-        os.replace(tmpname, filename)
-    except Exception:
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for g in goals:
-                writer.writerow([g.id, g.entityId, g.name, g.targetHours, g.status])
-        try:
-            if os.path.exists(tmpname):
-                os.remove(tmpname)
-        except Exception:
-            pass
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for g in goals:
+        cursor.execute(
+            "UPDATE goals SET name = ?, target_hours = ?, status = ? WHERE id = ?",
+            (g.name, g.targetHours, g.status, g.id)
+        )
+    conn.commit()
+    conn.close()
 
     
     

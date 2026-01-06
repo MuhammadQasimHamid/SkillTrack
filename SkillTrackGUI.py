@@ -19,9 +19,10 @@ from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QPushButton, QMessageBox,
-    QComboBox, QTabWidget, QFormLayout, QDialog, QDialogButtonBox, QDateEdit, QSizePolicy, QStyle, QFileDialog
+    QComboBox, QTabWidget, QFormLayout, QDialog, QDialogButtonBox, QDateEdit, QSizePolicy, QStyle, QFileDialog,
+    QSystemTrayIcon, QMenu, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QDate
+from PyQt6.QtCore import Qt, QTimer, QDate, QSettings, QSize, QPoint
 
 # Matplotlib (optional) for plotting reports
 try:
@@ -45,9 +46,10 @@ from skilltrack.controller import (
     get_started_sessions, start_entity_session, stop_session,
     get_completed_sessions, generate_report,
     register_user, login_user, logout_user, is_authenticated, current_user, list_users,
-    get_goals, add_goal, update_goal, delete_goal
+    get_goals, add_goal, update_goal, delete_goal,
+    delete_session, recover_session
 )
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QIcon
 
 
 class AddEntityDialog(QDialog):
@@ -204,9 +206,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SkillTrack - Compact")
-        # Use a resizable, comfortable default window
-        self.resize(900, 600)
-        self.setMinimumSize(700, 500)
+        # Load saved window geometry
+        self.settings = QSettings("SkillTrack", "SkillTrackGUI")
+        self.resize(self.settings.value("size", QSize(900, 600)))
+        self.move(self.settings.value("pos", QPoint(50, 50)))
+        self.setMinimumSize(100, 100)
+        
+        # Set window icon
+        if os.path.exists("stopwatch.png"):
+            self.setWindowIcon(QIcon("stopwatch.png"))
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -238,6 +246,9 @@ class MainWindow(QMainWindow):
         # Account menu and status
         self._build_account_menu()
         self.update_user_ui()
+
+        # System Tray initialization
+        self.setup_system_tray()
 
         self.refresh_all()
 
@@ -303,6 +314,103 @@ class MainWindow(QMainWindow):
             self.update_user_ui()
             self.refresh_all()
 
+    def setup_system_tray(self):
+        # Create the tray icon
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # Use stopwatch.png if it exists
+        if os.path.exists("stopwatch.png"):
+            self.tray_icon.setIcon(QIcon("stopwatch.png"))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        
+        # Create the tray menu
+        self.tray_menu = QMenu(self)
+        
+        self.restore_action = QAction("Restore", self)
+        self.restore_action.triggered.connect(self.showNormal)
+        self.restore_action.triggered.connect(self.activateWindow)
+        
+        self.quit_action = QAction("Exit", self)
+        self.quit_action.triggered.connect(QApplication.instance().quit)
+        
+        # dynamic_timers_menu will be populated in update_tray_menu
+        self.tray_menu.addAction(self.restore_action)
+        self.tray_menu.addSeparator()
+        # placeholder for timers will be between separators
+        self.tray_menu.addAction(self.quit_action)
+        
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.activateWindow()
+
+    def update_tray_menu(self):
+        # Clear existing dynamic timer actions
+        # We'll recreate the menu structure to keep it simple
+        self.tray_menu.clear()
+        self.tray_menu.addAction(self.restore_action)
+        self.tray_menu.addSeparator()
+        
+        now = datetime.now()
+        active_found = False
+        if hasattr(self, 'started') and self.started:
+            for s in self.started:
+                # find entity name
+                entity = next((e for e in self.entities if e.id == s.entityId), None)
+                if entity:
+                    active_found = True
+                    elapsed = int((now - s.startTime).total_seconds())
+                    h = elapsed // 3600
+                    m = (elapsed % 3600) // 60
+                    sec = elapsed % 60
+                    timer_text = f"● {entity.name}: {h:02d}:{m:02d}:{sec:02d}"
+                    timer_action = QAction(timer_text, self)
+                    # Clicking a timer action could restore the window
+                    timer_action.triggered.connect(self.showNormal)
+                    timer_action.triggered.connect(self.activateWindow)
+                    self.tray_menu.addAction(timer_action)
+        
+        if not active_found:
+            no_timers_action = QAction("No running timers", self)
+            no_timers_action.setEnabled(False)
+            self.tray_menu.addAction(no_timers_action)
+            self.tray_icon.setToolTip("SkillTrack: No running timers")
+        else:
+            # Build tooltip string for running timers
+            tooltips = ["SkillTrack: Running Timers"]
+            for s in self.started:
+                entity = next((e for e in self.entities if e.id == s.entityId), None)
+                if entity:
+                    elapsed = int((now - s.startTime).total_seconds())
+                    h = elapsed // 3600
+                    m = (elapsed % 3600) // 60
+                    sec = elapsed % 60
+                    tooltips.append(f"• {entity.name}: {h:02d}:{m:02d}:{sec:02d}")
+            self.tray_icon.setToolTip("\n".join(tooltips))
+            
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.quit_action)
+
+    def closeEvent(self, event):
+        # Save window geometry
+        self.settings.setValue("size", self.size())
+        self.settings.setValue("pos", self.pos())
+        
+        if self.tray_icon.isVisible():
+            # Hide to tray instead of closing
+            self.hide()
+            event.ignore()
+        else:
+            event.accept()
+
     def _build_entities_tab(self):
         layout = QVBoxLayout()
         self.entity_list = QListWidget()
@@ -333,13 +441,28 @@ class MainWindow(QMainWindow):
         top.addWidget(self.sessions_refresh_btn)
         layout.addLayout(top)
 
+        # Show deleted sessions checkbox
+        self.show_deleted_sessions_cb = QCheckBox('Show Deleted Sessions')
+        self.show_deleted_sessions_cb.stateChanged.connect(self.load_sessions)
+        layout.addWidget(self.show_deleted_sessions_cb)
+
         # sessions list
         self.sessions_list = QListWidget()
         self.sessions_list.itemDoubleClicked.connect(self.show_session_details)
         layout.addWidget(self.sessions_list)
 
+        # Buttons for delete/recover
+        buttons_layout = QHBoxLayout()
+        self.delete_session_btn = QPushButton("Delete Session")
+        self.delete_session_btn.clicked.connect(self.on_delete_session)
+        self.recover_session_btn = QPushButton("Recover Session")
+        self.recover_session_btn.clicked.connect(self.on_recover_session)
+        buttons_layout.addWidget(self.delete_session_btn)
+        buttons_layout.addWidget(self.recover_session_btn)
+        layout.addLayout(buttons_layout)
+
         # note about content
-        note = QLabel('Showing completed sessions only. Double-click a session for details.')
+        note = QLabel('Double-click a session for details.')
         note.setStyleSheet('color:#666;font-size:11px;')
         layout.addWidget(note)
 
@@ -546,6 +669,9 @@ class MainWindow(QMainWindow):
             item.setSizeHint(widget.sizeHint())
             self.timer_list.addItem(item)
             self.timer_list.setItemWidget(item, widget)
+        
+        # update system tray menu as well
+        self.update_tray_menu()
 
     def toggle_timer(self, entity_id):
         entity = next((x for x in self.entities if x.id == entity_id), None)
@@ -572,8 +698,12 @@ class MainWindow(QMainWindow):
 
     def load_sessions(self):
         """Load and display completed sessions filtered by entity."""
+        show_deleted = False
+        if hasattr(self, 'show_deleted_sessions_cb'):
+            show_deleted = self.show_deleted_sessions_cb.isChecked()
+            
         try:
-            completed = get_completed_sessions()
+            completed = get_completed_sessions(include_deleted=show_deleted)
         except Exception:
             completed = []
 
@@ -603,6 +733,29 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, s)
             self.sessions_list.addItem(item)
+
+    def on_delete_session(self):
+        curr = self.sessions_list.currentItem()
+        if not curr:
+            QMessageBox.warning(self, "Select Session", "Please select a session to delete.")
+            return
+        s = curr.data(Qt.ItemDataRole.UserRole)
+        confirm = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete session {s.id}?")
+        if confirm == QMessageBox.StandardButton.Yes:
+            delete_session(s.id)
+            self.load_sessions()
+
+    def on_recover_session(self):
+        if not self.show_deleted_sessions_cb.isChecked():
+            QMessageBox.information(self, "Note", "Check 'Show Deleted Sessions' to see sessions you can recover.")
+            return
+        curr = self.sessions_list.currentItem()
+        if not curr:
+            QMessageBox.warning(self, "Select Session", "Please select a deleted session to recover.")
+            return
+        s = curr.data(Qt.ItemDataRole.UserRole)
+        recover_session(s.id)
+        self.load_sessions()
 
     def show_session_details(self, item):
         s = item.data(Qt.ItemDataRole.UserRole)
@@ -1169,11 +1322,26 @@ if __name__ == "__main__":
         QTextEdit { background: #ffffff; border: none; padding: 6px; }
         QLabel { color: #333; }
     """)
-    # Prompt for login at startup
-    login = LoginDialog()
-    if login.exec() != QDialog.DialogCode.Accepted:
-        # user cancelled
-        sys.exit(0)
+    # Check for auto-login file
+    authenticated = False
+    if os.path.exists("login.txt"):
+        try:
+            with open("login.txt", "r") as f:
+                line = f.readline().strip()
+                if ',' in line:
+                    u, p = line.split(',', 1)
+                    from skilltrack.controller import login_user
+                    if login_user(u, p):
+                        authenticated = True
+        except Exception:
+            pass
+
+    if not authenticated:
+        # Prompt for login at startup
+        login = LoginDialog()
+        if login.exec() != QDialog.DialogCode.Accepted:
+            # user cancelled
+            sys.exit(0)
 
     win = MainWindow()
     win.show()
