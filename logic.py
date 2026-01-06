@@ -20,11 +20,12 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 class Session:
-    def __init__(self,id,startTime,endTime,entityId):
+    def __init__(self,id,startTime,endTime,entityId,is_deleted=0):
         self.id = id
         self.startTime = startTime
         self.endTime = endTime
         self.entityId = entityId
+        self.is_deleted = is_deleted
     
 class Entity:
     def __init__(self,id,name,type,description):
@@ -257,7 +258,7 @@ def loadSessionsFromFile(filename='complete_sessions.txt', username=None, includ
         start = _parse_iso_datetime(row['start_time'])
         end = _parse_iso_datetime(row['end_time'])
         if start and end:
-            sessions.append(Session(row['id'], start, end, row['entity_id']))
+            sessions.append(Session(row['id'], start, end, row['entity_id'], row['is_deleted']))
     conn.close()
     return sessions
 
@@ -311,7 +312,7 @@ def loadStartedSessionsFromFile(filename='started_sessions.txt', username=None):
     for row in cursor.fetchall():
         start = _parse_iso_datetime(row['start_time'])
         if start:
-            sessions.append(Session(row['id'], start, None, row['entity_id']))
+            sessions.append(Session(row['id'], start, None, row['entity_id'], row['is_deleted']))
     conn.close()
     return sessions
 

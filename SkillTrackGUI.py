@@ -202,6 +202,67 @@ class EditEntityDialog(AddEntityDialog):
         self.desc_input.setText(desc)
 
 
+class TrashBinDialog(QDialog):
+    def __init__(self, entities, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Trash Bin - Deleted Sessions")
+        self.resize(500, 400)
+        self.entities = entities
+        self.layout = QVBoxLayout(self)
+        
+        self.list = QListWidget()
+        self.list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self.layout.addWidget(self.list)
+        
+        self.refresh_list()
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addWidget(self.buttons)
+
+    def refresh_list(self):
+        self.list.clear()
+        try:
+            all_sessions = get_completed_sessions(include_deleted=True)
+            deleted = [s for s in all_sessions if s.is_deleted == 1]
+        except Exception:
+            deleted = []
+        
+        for s in sorted(deleted, key=lambda x: x.startTime, reverse=True):
+            ent = next((e for e in self.entities if e.id == s.entityId), None)
+            name = ent.name if ent else f"Entity {s.entityId}"
+            start_str = s.startTime.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create a widget for the row
+            item_widget = QWidget()
+            item_layout = QHBoxLayout(item_widget)
+            item_layout.setContentsMargins(5, 2, 5, 2)
+            
+            info = QLabel(f"[{s.id}] {name} — {start_str}")
+            info.setStyleSheet("font-size: 11px;")
+            
+            restore_btn = QPushButton("Restore")
+            restore_btn.setFixedWidth(70)
+            restore_btn.setStyleSheet("background-color: #d1e7dd; border: 1px solid #badbcc; border-radius: 4px;")
+            restore_btn.clicked.connect(lambda checked, sess_id=s.id: self.on_restore_item(sess_id))
+            
+            item_layout.addWidget(info)
+            item_layout.addStretch()
+            item_layout.addWidget(restore_btn)
+            
+            item = QListWidgetItem(self.list)
+            item.setSizeHint(item_widget.sizeHint())
+            self.list.addItem(item)
+            self.list.setItemWidget(item, item_widget)
+
+    def on_restore_item(self, session_id):
+        recover_session(session_id)
+        # QMessageBox.information(self, "Restored", f"Session {session_id} has been restored.")
+        self.refresh_list()
+        if self.parent():
+            self.parent().load_sessions()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -213,8 +274,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(100, 100)
         
         # Set window icon
-        if os.path.exists("stopwatch.png"):
-            self.setWindowIcon(QIcon("stopwatch.png"))
+        for icon_path in ["stopwatch.ico", "stopwatch.png"]:
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                break
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -318,10 +381,14 @@ class MainWindow(QMainWindow):
         # Create the tray icon
         self.tray_icon = QSystemTrayIcon(self)
         
-        # Use stopwatch.png if it exists
-        if os.path.exists("stopwatch.png"):
-            self.tray_icon.setIcon(QIcon("stopwatch.png"))
-        else:
+        # Use stopwatch.ico or stopwatch.png if they exist
+        icon_set = False
+        for icon_path in ["stopwatch.ico", "stopwatch.png"]:
+            if os.path.exists(icon_path):
+                self.tray_icon.setIcon(QIcon(icon_path))
+                icon_set = True
+                break
+        if not icon_set:
             self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
         
         # Create the tray menu
@@ -441,30 +508,35 @@ class MainWindow(QMainWindow):
         top.addWidget(self.sessions_refresh_btn)
         layout.addLayout(top)
 
-        # Show deleted sessions checkbox
-        self.show_deleted_sessions_cb = QCheckBox('Show Deleted Sessions')
-        self.show_deleted_sessions_cb.stateChanged.connect(self.load_sessions)
-        layout.addWidget(self.show_deleted_sessions_cb)
-
         # sessions list
         self.sessions_list = QListWidget()
         self.sessions_list.itemDoubleClicked.connect(self.show_session_details)
         layout.addWidget(self.sessions_list)
 
-        # Buttons for delete/recover
-        buttons_layout = QHBoxLayout()
-        self.delete_session_btn = QPushButton("Delete Session")
-        self.delete_session_btn.clicked.connect(self.on_delete_session)
-        self.recover_session_btn = QPushButton("Recover Session")
-        self.recover_session_btn.clicked.connect(self.on_recover_session)
-        buttons_layout.addWidget(self.delete_session_btn)
-        buttons_layout.addWidget(self.recover_session_btn)
-        layout.addLayout(buttons_layout)
-
+        # Compact bottom row for session actions
+        bottom_row = QHBoxLayout()
+        
         # note about content
-        note = QLabel('Double-click a session for details.')
-        note.setStyleSheet('color:#666;font-size:11px;')
-        layout.addWidget(note)
+        note = QLabel('Double-click for details')
+        note.setStyleSheet('color:#666;font-size:10px;')
+        bottom_row.addWidget(note)
+        
+        bottom_row.addStretch()
+
+        self.delete_session_btn = QPushButton("Delete")
+        self.delete_session_btn.setToolTip("Delete selected session")
+        self.delete_session_btn.setFixedWidth(80)
+        self.delete_session_btn.clicked.connect(self.on_delete_session)
+        
+        self.trash_btn = QPushButton("Trash")
+        self.trash_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self.trash_btn.setToolTip("View deleted sessions")
+        self.trash_btn.setFixedWidth(80)
+        self.trash_btn.clicked.connect(self.on_open_trash)
+        
+        bottom_row.addWidget(self.delete_session_btn)
+        bottom_row.addWidget(self.trash_btn)
+        layout.addLayout(bottom_row)
 
         self.sessions_tab.setLayout(layout)
 
@@ -696,14 +768,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Started", f"Session {session.id} started for {entity.name}")
         self.refresh_all()
 
+    def on_open_trash(self):
+        dlg = TrashBinDialog(self.entities, self)
+        dlg.exec()
+
     def load_sessions(self):
         """Load and display completed sessions filtered by entity."""
-        show_deleted = False
-        if hasattr(self, 'show_deleted_sessions_cb'):
-            show_deleted = self.show_deleted_sessions_cb.isChecked()
-            
         try:
-            completed = get_completed_sessions(include_deleted=show_deleted)
+            completed = get_completed_sessions(include_deleted=False)
         except Exception:
             completed = []
 
@@ -744,18 +816,6 @@ class MainWindow(QMainWindow):
         if confirm == QMessageBox.StandardButton.Yes:
             delete_session(s.id)
             self.load_sessions()
-
-    def on_recover_session(self):
-        if not self.show_deleted_sessions_cb.isChecked():
-            QMessageBox.information(self, "Note", "Check 'Show Deleted Sessions' to see sessions you can recover.")
-            return
-        curr = self.sessions_list.currentItem()
-        if not curr:
-            QMessageBox.warning(self, "Select Session", "Please select a deleted session to recover.")
-            return
-        s = curr.data(Qt.ItemDataRole.UserRole)
-        recover_session(s.id)
-        self.load_sessions()
 
     def show_session_details(self, item):
         s = item.data(Qt.ItemDataRole.UserRole)
