@@ -15,8 +15,9 @@
 import os
 import csv
 import tempfile
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 class Session:
     def __init__(self,id,startTime,endTime,entityId):
@@ -65,6 +66,70 @@ def _parse_iso_datetime(value: str) -> Optional[datetime]:
     except Exception:
         return None
 
+# --- SQLite Database Initialization ---
+DB_FILE = 'skilltrack.db'
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            salt TEXT NOT NULL,
+            pwdhash TEXT NOT NULL,
+            iterations INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    
+    # Entities table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            description TEXT,
+            username TEXT NOT NULL,
+            FOREIGN KEY (username) REFERENCES users (username)
+        )
+    ''')
+    
+    # Sessions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            FOREIGN KEY (entity_id) REFERENCES entities (id)
+        )
+    ''')
+    
+    # Goals table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            target_hours REAL NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY (entity_id) REFERENCES entities (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database on module load
+init_db()
+
 # --- User auth helpers ---
 class User:
     def __init__(self, username: str, salt: str, pwdhash: str, iterations: int, created: datetime):
@@ -89,66 +154,48 @@ def _hash_password(password: str, salt: bytes = None, iterations: int = 100000):
 def loadUsersFromFile(filename='users.txt'):
     """Return dict username -> User"""
     users = {}
-    if not os.path.exists(filename):
-        return users
-    with open(filename, 'r', newline='', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        for row in reader:
-            if not row or len(row) < 5:
-                continue
-            try:
-                username = row[0]
-                salt = row[1]
-                pwdhash = row[2]
-                iterations = int(row[3])
-                created = _parse_iso_datetime(row[4]) or datetime.now()
-                users[username] = User(username, salt, pwdhash, iterations, created)
-            except Exception:
-                continue
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+    for row in cursor.fetchall():
+        users[row['username']] = User(
+            row['username'], row['salt'], row['pwdhash'], 
+            row['iterations'], _parse_iso_datetime(row['created_at'])
+        )
+    conn.close()
     return users
 
 
-def saveUsersToFile(users: dict, filename='users.txt'):
-    _ensure_file_exists(filename)
-    dirpath = os.path.dirname(os.path.abspath(filename)) or '.'
-    tmpfd, tmpname = tempfile.mkstemp(dir=dirpath)
-    try:
-        with os.fdopen(tmpfd, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for u in users.values():
-                writer.writerow([u.username, u.salt, u.pwdhash, u.iterations, u.created.isoformat()])
-        os.replace(tmpname, filename)
-    except Exception:
-        with open(filename, 'w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            for u in users.values():
-                writer.writerow([u.username, u.salt, u.pwdhash, u.iterations, u.created.isoformat()])
-        try:
-            if os.path.exists(tmpname):
-                os.remove(tmpname)
-        except Exception:
-            pass
-
-
 def create_user(username: str, password: str, filename='users.txt') -> bool:
-    users = loadUsersFromFile(filename)
+    users = loadUsersFromFile()
     if username in users:
         return False
     salt_hex, hash_hex, iterations = _hash_password(password)
-    users[username] = User(username, salt_hex, hash_hex, iterations, datetime.now())
-    saveUsersToFile(users, filename)
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO users (username, salt, pwdhash, iterations, created_at) VALUES (?, ?, ?, ?, ?)",
+        (username, salt_hex, hash_hex, iterations, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
     return True
 
 
 def authenticate_user(username: str, password: str, filename='users.txt') -> bool:
-    users = loadUsersFromFile(filename)
-    u = users.get(username)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    u = cursor.fetchone()
+    conn.close()
+    
     if not u:
         return False
     try:
-        salt = binascii.unhexlify(u.salt)
-        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, u.iterations)
-        return hmac.compare_digest(binascii.hexlify(dk).decode('ascii'), u.pwdhash)
+        salt = binascii.unhexlify(u['salt'])
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, u['iterations'])
+        return hmac.compare_digest(binascii.hexlify(dk).decode('ascii'), u['pwdhash'])
     except Exception:
         return False
 
